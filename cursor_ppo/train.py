@@ -15,7 +15,6 @@ import socket
 import math
 import sys
 from torch.utils.tensorboard import SummaryWriter
-import traceback
 
 # Local imports
 from load_data import load_processed_samples
@@ -36,48 +35,67 @@ binary_mask = F.interpolate(
     binary_mask.unsqueeze(0).unsqueeze(0).float(),
     size=(256, 256),
     mode='nearest'
-)
+).to('cuda')
+
+# Add these parameters near the top of train.py
+WARMUP_STEPS = 16  # Steps before starting fine-tuning
+UNFREEZE_INTERVALS = {
+    32: ('layer4', 0.9),    # Start with very strong clustering influence
+    96: ('layer3', 0.8),    # Keep clustering dominant longer
+    160: ('layer2', 0.7),   # Maintain strong clustering bias
+    224: ('layer1', 0.6),   # Still favor clustering at the end
+}
+
+# Add warmup period for segmentation head
+SEGMENTATION_WARMUP_STEPS = 24  # Train only segmentation head initially
 
 def setup_ddp(rank, world_size):
-    """Setup DDP with better error handling and port management"""
+    """Setup DDP with increased timeout and better error handling"""
     try:
-        # Try different ports if the default is in use
-        base_port = 29500
-        max_attempts = 10
+        print(f"[train.py] setup_ddp called. rank={rank}, world_size={world_size}")
         
-        for port_offset in range(max_attempts):
-            try:
-                os.environ['MASTER_ADDR'] = 'localhost'
-                os.environ['MASTER_PORT'] = str(base_port + port_offset)
-                
-                # Initialize process group
-                dist.init_process_group(
-                    backend='nccl',
-                    init_method=f'tcp://localhost:{base_port + port_offset}',
-                    world_size=world_size,
-                    rank=rank
-                )
-                print(f"[train.py] init_process_group done for rank={rank}.")
-                return
-            except RuntimeError as e:
-                if port_offset == max_attempts - 1:
-                    raise
-                print(f"[train.py] Port {base_port + port_offset} in use, trying next port...")
-                continue
-                
+        # Use fixed port but different for each run
+        base_port = 29500
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
+        os.environ['MASTER_PORT'] = str(base_port + rank)
+        
+        # Increase timeout and add NCCL configurations
+        os.environ["NCCL_DEBUG"] = "INFO"
+        os.environ["NCCL_SOCKET_TIMEOUT"] = "300"
+        os.environ["NCCL_IB_TIMEOUT"] = "300"
+        
+        # Initialize process group with increased timeout
+        dist.init_process_group(
+            backend='nccl',
+            init_method=f'tcp://127.0.0.1:{base_port}',
+            world_size=world_size,
+            rank=rank,
+            timeout=datetime.timedelta(minutes=5)  # Increased from 60 seconds to 5 minutes
+        )
+        
+        # Set device and CUDA settings
+        torch.cuda.set_device(rank)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Set NCCL to use the same device as PyTorch
+        torch.cuda.set_device(rank)
+        
+        print(f"[train.py] init_process_group done for rank={rank}.")
+        
     except Exception as e:
         print(f"[train.py] Error in setup_ddp for rank {rank}: {str(e)}")
         raise
 
 def cleanup_ddp(rank):
-    """Cleanup DDP resources"""
+    """Cleanup DDP process group"""
     try:
-        print(f"[train.py] [Rank={rank}] cleanup_ddp: destroying process group...")
         if dist.is_initialized():
+            print(f"[train.py] [Rank={rank}] cleanup_ddp: destroying process group...")
             dist.destroy_process_group()
-        print(f"[train.py] [Rank={rank}] cleanup_ddp done.")
+            print(f"[train.py] [Rank={rank}] cleanup_ddp done.")
     except Exception as e:
-        print(f"[train.py] [Rank={rank}] Error during cleanup: {str(e)}")
+        print(f"[train.py] [Rank={rank}] Error in cleanup_ddp: {str(e)}")
 
 def compute_cross_set_consistency(features: torch.Tensor, batch_size: int) -> float:
     """
@@ -268,8 +286,23 @@ class FeatureWeightingEnv(gym.Env):
         return obs.cpu().numpy()
 
     def step(self, action):
-        """Execute environment step"""
+        """Execute environment step with fine-tuning control"""
         self.total_steps += 1
+        
+        # Check if we should unfreeze layers or update mixing ratio
+        if self.total_steps >= WARMUP_STEPS:
+            for step_threshold, (layer, alpha) in UNFREEZE_INTERVALS.items():
+                if self.total_steps == step_threshold:
+                    if isinstance(self.segmenter, torch.nn.parallel.DistributedDataParallel):
+                        self.segmenter.module.feature_extractor.unfreeze_layer(layer)
+                        self.segmenter.module.feature_extractor.set_mixing_alpha(alpha)
+                    else:
+                        self.segmenter.feature_extractor.unfreeze_layer(layer)
+                        self.segmenter.feature_extractor.set_mixing_alpha(alpha)
+                    
+                    if self.writer is not None:
+                        self.writer.add_scalar('Training/mixing_alpha', alpha, self.total_steps)
+                        self.writer.add_text('Training/unfrozen_layer', layer, self.total_steps)
         
         # Update weights
         new_weights = torch.tensor(action, device=self.device)
@@ -372,66 +405,15 @@ class FeatureWeightingEnv(gym.Env):
 ###############################################################################
 #  train_ddp
 ###############################################################################
-def compute_combined_segmentation(features, seg_logits, alpha, binary_mask, device, rank):
-    """Compute combined segmentation from clustering and ResNet50"""
-    print(f"[Rank {rank}] Starting compute_combined_segmentation with alpha={alpha}")
-    
-    try:
-        # Synchronize before CPU operations
-        torch.cuda.synchronize(device)
-        dist.barrier()
-        print(f"[Rank {rank}] Pre-clustering sync complete")
-        
-        # Get clustering-based segmentation
-        print(f"[Rank {rank}] Computing clustering segmentation...")
-        cluster_seg = compute_segmentation_map(features, binary_mask, rank)  # [B, 1, H, W]
-        print(f"[Rank {rank}] Cluster segmentation complete. Shape: {cluster_seg.shape}")
-        
-        # Synchronize after clustering
-        torch.cuda.synchronize(device)
-        dist.barrier()
-        print(f"[Rank {rank}] Post-clustering sync complete")
-        
-        # Get ResNet50 segmentation
-        print(f"[Rank {rank}] Computing ResNet50 segmentation...")
-        resnet_seg = torch.sigmoid(seg_logits)  # [B, 1, H, W]
-        print(f"[Rank {rank}] ResNet50 segmentation complete. Shape: {resnet_seg.shape}")
-        
-        # Combine segmentations with alpha weighting
-        print(f"[Rank {rank}] Combining segmentations...")
-        combined_seg = alpha * cluster_seg + (1 - alpha) * resnet_seg
-        print(f"[Rank {rank}] Combined segmentation complete. Shape: {combined_seg.shape}")
-        
-        # Threshold to get binary segmentation
-        binary_seg = (combined_seg > 0.5).float()
-        print(f"[Rank {rank}] Binary thresholding complete")
-        
-        # Final sync before returning
-        torch.cuda.synchronize(device)
-        dist.barrier()
-        print(f"[Rank {rank}] Final sync complete")
-        
-        return binary_seg
-        
-    except Exception as e:
-        print(f"[Rank {rank}] Error in compute_combined_segmentation: {str(e)}")
-        print(f"[Rank {rank}] Error traceback: {traceback.format_exc()}")
-        raise
-
 def train_ddp(rank, world_size, processed_samples):
     """Training function with better error handling"""
-    # Initialize writer as None at the start
-    writer = None
-    
     try:
         # Setup DDP
         setup_ddp(rank, world_size)
         device = torch.device(f"cuda:{rank}")
         
-        # Move binary mask to correct device for this rank
-        binary_mask_device = binary_mask.to(device)
-        
         # Initialize tensorboard writer for rank 0
+        writer = None
         if rank == 0:
             writer = SummaryWriter(f'runs/ppo_training_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}')
             os.makedirs('final_visuals', exist_ok=True)
@@ -450,24 +432,6 @@ def train_ddp(rank, world_size, processed_samples):
             static_graph=True
         )
 
-        # Create optimizer and scheduler for feature extractor
-        seg_optimizer = torch.optim.AdamW([
-            # Backbone layers with lower learning rate
-            {"params": [p for layer in ddp_feature_extractor.module.backbone_layers 
-                        for p in layer.parameters()], 
-             "lr": 1e-5},  # Lower learning rate for backbone
-            # Segmentation head with higher learning rate
-            {"params": ddp_feature_extractor.module.seg_head.parameters(), 
-             "lr": 1e-4}
-        ], weight_decay=0.01)
-        
-        # Cosine annealing scheduler
-        seg_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            seg_optimizer,
-            T_max=10000,  # Total number of steps
-            eta_min=1e-6   # Minimum learning rate
-        )
-
         env = FeatureWeightingEnv(
             segmenter_model=ddp_feature_extractor,
             processed_samples=processed_samples,
@@ -476,11 +440,11 @@ def train_ddp(rank, world_size, processed_samples):
             enable_render=(rank == 0),
             render_patience=10,
             visualize=True,
-            writer=writer
+            writer=writer  # Pass writer to environment
         )
 
         # Create PPO agent with learning rate schedulers
-        initial_pi_lr = 3e-5  # Keep current initial policy learning rate
+        initial_pi_lr = 1e-5  # Keep current initial policy learning rate
         initial_vf_lr = 1e-3  # Keep current initial value function learning rate
         
         # Define learning rate scheduler parameters
@@ -540,37 +504,9 @@ def train_ddp(rank, world_size, processed_samples):
         # Initialize metrics
         metrics = None
         
-        # Initialize alpha at the start
-        alpha = 0.9  # Start with 90% clustering weight
+        # For warmup steps
+        print(f"[train.py] Starting warmup phase ({WARMUP_STEPS} steps)")
         
-        # Recommended ResNet50 fine-tuning settings
-        start_frames = 16    # Half of n_steps (32/2)
-        end_frames = 48     # 1.5x n_steps (to give time for adaptation)
-
-        # Since you're using large batch size (1024) and small n_steps (32)
-        # We want quick unfreezing to match the fast training pace
-        unfreeze_interval = 8   # Unfreeze every 8 steps (4 layers over 32 steps)
-
-        initial_alpha = 0.9  # Keep this - good for large batch size
-        final_alpha = 0.3   # Keep this - good balance
-
-        def get_current_alpha(frames):
-            """Compute current alpha based on training progress"""
-            if frames <= start_frames:
-                return initial_alpha
-            elif frames >= end_frames:
-                return final_alpha
-            else:
-                # Linear interpolation
-                progress = (frames - start_frames) / (end_frames - start_frames)
-                return initial_alpha + (final_alpha - initial_alpha) * progress
-
-        # Add unfreezing schedule parameters
-        last_unfreeze_step = 0
-        layers_unfrozen = 0
-        max_layers = 4  # Total number of backbone layers
-
-        # Training loop with self-training phase
         while total_frames < total_timesteps:
             try:
                 # Synchronize before training step
@@ -580,96 +516,8 @@ def train_ddp(rank, world_size, processed_samples):
                 if rank == 0:
                     pbar = tqdm(total=n_steps, desc=f"Episode {episode_count}", leave=False)
                 
-                # Original PPO training step
+                # Run training step
                 metrics = agent.learn(total_timesteps=n_steps, pbar=pbar if rank == 0 else None)
-                
-                # Update alpha based on training progress
-                alpha = get_current_alpha(total_frames)
-                
-                if rank == 0:
-                    # Log alpha value
-                    writer.add_scalar('Training/alpha', alpha, total_frames)
-                    writer.add_scalar('Training/clustering_weight', alpha, total_frames)
-                    writer.add_scalar('Training/resnet_weight', 1-alpha, total_frames)
-                
-                # Self-training phase using clustering results
-                if total_frames > 1000:
-                    # Fine-tuning step
-                    try:
-                        # Synchronize all processes before mode change
-                        dist.barrier()
-                        
-                        # Switch to training mode on all processes
-                        ddp_feature_extractor.train()
-                        ddp_feature_extractor.module.set_training_mode('finetune')
-                        
-                        # Get batch of images and prepare them
-                        sample_indices = torch.randint(0, len(processed_samples), (128,))
-                        images = torch.stack([
-                            torch.from_numpy(processed_samples[i][1]).float().to(device)
-                            for i in sample_indices
-                        ])
-                        images = images.permute(0, 3, 1, 2).contiguous()
-                        
-                        # Forward pass
-                        features, seg_logits = ddp_feature_extractor(images)
-                        
-                        # Get pseudo-labels using combined segmentation
-                        with torch.no_grad():
-                            pseudo_labels = compute_combined_segmentation(
-                                features.detach(),
-                                seg_logits.detach(),
-                                alpha,  # Now alpha is defined
-                                binary_mask_device,
-                                device,
-                                rank
-                            )
-                        
-                        # Compute loss and backward
-                        seg_loss = F.binary_cross_entropy_with_logits(
-                            seg_logits,
-                            pseudo_labels,
-                            reduction='mean'
-                        )
-                        
-                        # Clear gradients
-                        ddp_feature_extractor.zero_grad()
-                        
-                        # Backward pass
-                        seg_loss.backward()
-                        
-                        # Update weights
-                        seg_optimizer.step()
-                        seg_scheduler.step()
-                        
-                        # Switch back to feature extraction mode
-                        ddp_feature_extractor.eval()
-                        ddp_feature_extractor.module.set_training_mode('feature_extract')
-                        
-                        # Synchronize after training step
-                        dist.barrier()
-                        
-                    except Exception as e:
-                        print(f"[Rank {rank}] Error in fine-tuning: {str(e)}")
-                        raise
-                    
-                    if rank == 0:
-                        # Save more frequently during early training
-                        if total_frames < 100:  # First 100 frames
-                            save_interval = 5    # Save every 5 steps
-                        else:
-                            save_interval = 1000  # Then every 1000 steps
-                        
-                        if total_frames % save_interval == 0:
-                            save_segmentation_results(
-                                images, 
-                                seg_logits, 
-                                pseudo_labels,
-                                total_frames,
-                                alpha,
-                                ddp_feature_extractor,
-                                binary_mask_device
-                            )
                 
                 # Synchronize after training step
                 torch.cuda.synchronize(device)
@@ -767,14 +615,6 @@ def train_ddp(rank, world_size, processed_samples):
                         writer.add_scalar('LearningRates/policy_lr', pi_lr, total_frames)
                         writer.add_scalar('LearningRates/value_lr', vf_lr, total_frames)
 
-                    # Check if it's time to unfreeze next layer
-                    if (total_frames - last_unfreeze_step) >= unfreeze_interval and layers_unfrozen < max_layers:
-                        if ddp_feature_extractor.module.unfreeze_next_layer():
-                            layers_unfrozen += 1
-                            last_unfreeze_step = total_frames
-                            if rank == 0:
-                                print(f"\nUnfreezing layer {layers_unfrozen} at step {total_frames}")
-
             except RuntimeError as e:
                 print(f"\nError on rank {rank}: {str(e)}")
                 if "CUDA out of memory" in str(e):
@@ -786,107 +626,45 @@ def train_ddp(rank, world_size, processed_samples):
                 print(f"\nUnexpected error on rank {rank}: {str(e)}")
                 raise
 
+        # For warmup steps
+        print(f"[train.py] Warmup phase completed after {WARMUP_STEPS} steps")
+
     except Exception as e:
-        print(f"[Rank {rank}] Error during training: {str(e)}")
-        print(f"[Rank {rank}] Error traceback: {traceback.format_exc()}")
+        print(f"Error on rank {rank}: {str(e)}")
         raise
     finally:
-        # Cleanup
-        if writer is not None:
+        if rank == 0 and writer is not None:
             writer.close()
         cleanup_ddp(rank)
         torch.cuda.empty_cache()
 
-def save_segmentation_results(images, seg_logits, pseudo_labels, step, alpha, 
-                            ddp_feature_extractor, binary_mask, warmup_steps=64, 
-                            save_dir='segmentation_results'):
-    """Save segmentation results showing training phase progression"""
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    
-    # Convert image to numpy
-    image = images[0].cpu().permute(1, 2, 0).numpy()
-    
-    # Before ResNet50 fine-tuning starts (before step 1000)
-    if step <= 30:  # Changed from warmup_steps to match actual fine-tuning start
-        # Only show original and clustering since ResNet isn't trained yet
-        plt.figure(figsize=(10, 5))
-        
-        plt.subplot(121)
-        plt.imshow(image)
-        plt.title('Original Image')
-        plt.axis('off')
-        
-        # Only clustering is valid pre-fine-tuning
-        with torch.no_grad():
-            features = ddp_feature_extractor(images)
-            cluster_map = compute_segmentation_map(features, binary_mask)[0].cpu().numpy()
-        
-        plt.subplot(122)
-        plt.imshow(cluster_map, cmap='gray')
-        plt.title('Clustering Only (Pre-Fine-Tuning)')
-        plt.axis('off')
-        
-        plt.figtext(0.99, 0.01, 
-                   f'Step: {step}\nPre-Fine-Tuning Phase\nClustering: 100%',
-                   ha='right', bbox=dict(facecolor='white', alpha=0.8))
-    
-    else:
-        # After fine-tuning starts: Show all components
-        plt.figure(figsize=(20, 5))
-        
-        plt.subplot(141)
-        plt.imshow(image)
-        plt.title('Original Image')
-        plt.axis('off')
-        
-        # Get clustering result
-        with torch.no_grad():
-            features = ddp_feature_extractor(images)
-            cluster_map = compute_segmentation_map(features, binary_mask)[0].cpu().numpy()
-        
-        plt.subplot(142)
-        plt.imshow(cluster_map, cmap='gray')
-        plt.title(f'Clustering Weight: {alpha:.2f}')
-        plt.axis('off')
-        
-        # ResNet50's prediction (only valid after fine-tuning starts)
-        resnet_map = torch.sigmoid(seg_logits[0]).cpu().numpy()
-        plt.subplot(143)
-        plt.imshow(resnet_map, cmap='gray')
-        plt.title(f'ResNet50 Weight: {1-alpha:.2f}')
-        plt.axis('off')
-        
-        # Combined result
-        plt.subplot(144)
-        plt.imshow(pseudo_labels[0].cpu().numpy(), cmap='gray')
-        plt.title('Combined Training Target')
-        plt.axis('off')
-    
-    plt.savefig(f'{save_dir}/seg_result_step_{step}.png')
-    plt.close()
-
 def train_custom_ppo():
-    """Main training function with cleanup"""
+    """Main training function with better cleanup"""
     try:
-        # Try cleanup but don't fail if it doesn't work
-        try:
-            if os.path.exists("cleanup.py"):
-                import cleanup
-                cleanup.cleanup_processes()
-        except Exception as e:
-            print(f"Warning: Cleanup failed but continuing: {e}")
+        # Kill any existing process groups and clear environment
+        if dist.is_initialized():
+            dist.destroy_process_group()
         
-        # Clear CUDA memory explicitly
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
+        # Clear environment variables
+        for key in ['MASTER_ADDR', 'MASTER_PORT', 'WORLD_SIZE', 'RANK']:
+            if key in os.environ:
+                del os.environ[key]
+        
+        # Clear CUDA cache
+        torch.cuda.empty_cache()
+        
+        # Create visualization directory
+        os.makedirs('final_visuals', exist_ok=True)
+        
+        print("[main] Loading preprocessed samples...")
+        processed_samples = load_processed_samples()
+        print(f"[main] loaded {len(processed_samples)} samples")
+
+        # Use all available GPUs
         world_size = torch.cuda.device_count()
         print(f"[main] Using {world_size} GPUs")
         
-        processed_samples = load_processed_samples()
-        print(f"[main] loaded {len(processed_samples)} samples")
-        
+        # Start training processes
         mp.spawn(
             train_ddp,
             args=(world_size, processed_samples),
@@ -899,8 +677,9 @@ def train_custom_ppo():
         raise
     finally:
         # Final cleanup
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     train_custom_ppo()

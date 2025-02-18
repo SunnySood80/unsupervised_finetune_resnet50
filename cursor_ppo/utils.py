@@ -13,8 +13,6 @@ import csv
 import os
 import copy
 from feature_extract import DDPFeatureExtractor
-from sklearn.cluster import KMeans
-import traceback
 
 class MomentumEncoder:
     def __init__(self, model: nn.Module, momentum: float = 0.999):
@@ -232,19 +230,21 @@ def compute_local_coherence(features: torch.Tensor, kernel_size: int = 3) -> flo
     coherence = -F.mse_loss(features, local_mean)
     return float(coherence.item())
 
-def compute_segmentation_map(w_feats: torch.Tensor, binary_mask: torch.Tensor, rank: int = 0) -> torch.Tensor:
+def compute_segmentation_map(w_feats: torch.Tensor, binary_mask: torch.Tensor, n_iters: int = 3) -> torch.Tensor:
     """
-    Compute binary segmentation map using improved k-means clustering
+    Compute binary segmentation map using improved k-means clustering with:
+    1. Better centroid initialization
+    2. Multiple refinement iterations
+    3. Spatial regularization
+    4. Confidence thresholding
     
     Args:
-        w_feats: Feature tensor [B, C, H, W]
-        binary_mask: Binary mask (should be on same device as w_feats)
-        rank: Process rank for DDP
+        w_feats: Weighted feature tensor [B, C, H, W]
+        binary_mask: Binary mask tensor [1, 1, H, W]
+        n_iters: Number of k-means iterations
+    Returns:
+        Binary segmentation map tensor [H, W]
     """
-    # Ensure mask is on same device as features
-    device = w_feats.device
-    binary_mask = binary_mask.to(device)
-    
     # Resize binary mask to match feature size
     mask_resized = F.interpolate(
         binary_mask,
@@ -254,77 +254,90 @@ def compute_segmentation_map(w_feats: torch.Tensor, binary_mask: torch.Tensor, r
     
     # Apply binary mask and normalize features
     w_feats = w_feats * mask_resized
+    feat_flat = w_feats.squeeze(0).permute(1, 2, 0)  # [H, W, C]
+    feat_flat = F.normalize(feat_flat, dim=-1)
     
-    # Handle batch dimension properly
-    B, C, H, W = w_feats.shape
+    # Add spatial coordinates for regularization
+    H, W = w_feats.shape[2:]
+    y_coords = torch.linspace(-1, 1, H, device=w_feats.device)
+    x_coords = torch.linspace(-1, 1, W, device=w_feats.device)
+    yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
+    spatial_coords = torch.stack([yy, xx], dim=-1) * 0.1  # Scale factor for spatial influence
     
-    # Process each item in batch
-    seg_maps = []
-    for b in range(B):
-        # Get single item [C, H, W] -> [H, W, C]
-        feat_flat = w_feats[b].permute(1, 2, 0)
-        feat_flat = F.normalize(feat_flat, dim=-1)
+    # Combine features with spatial coordinates
+    feat_spatial = torch.cat([
+        feat_flat,
+        spatial_coords
+    ], dim=-1)
+    
+    # Flatten for clustering
+    N = H * W
+    D = feat_spatial.shape[-1]
+    feat_spatial = feat_spatial.reshape(N, D)
+    
+    # Initialize centroids using k-means++
+    centroids = torch.zeros((2, D), device=w_feats.device)
+    
+    # First centroid: maximum feature response
+    feat_norms = torch.norm(feat_flat.reshape(N, -1), dim=1)
+    first_idx = torch.argmax(feat_norms)
+    centroids[0] = feat_spatial[first_idx]
+    
+    # Second centroid: furthest point from first
+    dists = torch.norm(feat_spatial - centroids[0], dim=1)
+    second_idx = torch.argmax(dists)
+    centroids[1] = feat_spatial[second_idx]
+    
+    # K-means iterations
+    clusters = None
+    for _ in range(n_iters):
+        # Compute distances and assign clusters
+        dists = torch.cdist(feat_spatial, centroids)
+        new_clusters = dists.argmin(dim=1)
         
-        # Add spatial coordinates
-        y_coords = torch.linspace(-1, 1, H, device=w_feats.device)
-        x_coords = torch.linspace(-1, 1, W, device=w_feats.device)
-        yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
-        spatial_coords = torch.stack([yy, xx], dim=-1) * 0.1
-        
-        # Combine features with spatial coordinates
-        feat_spatial = torch.cat([
-            feat_flat,
-            spatial_coords
-        ], dim=-1)
-        
-        # Flatten for clustering
-        N = H * W
-        D = feat_spatial.shape[-1]
-        feat_spatial = feat_spatial.reshape(N, D)
-        
-        # Initialize centroids using k-means++
-        centroids = torch.zeros((2, D), device=w_feats.device)
-        
-        # First centroid: maximum feature response
-        feat_norms = torch.norm(feat_flat.reshape(N, -1), dim=1)
-        first_idx = torch.argmax(feat_norms)
-        centroids[0] = feat_spatial[first_idx]
-        
-        # Second centroid: furthest point from first
-        dists = torch.norm(feat_spatial - centroids[0], dim=1)
-        second_idx = torch.argmax(dists)
-        centroids[1] = feat_spatial[second_idx]
-        
-        # K-means iterations
-        clusters = None
-        for _ in range(3):  # n_iters = 3
-            dists = torch.cdist(feat_spatial, centroids)
-            new_clusters = dists.argmin(dim=1)
+        if clusters is not None and torch.all(new_clusters == clusters):
+            break
             
-            if clusters is not None and torch.all(new_clusters == clusters):
-                break
-                
-            clusters = new_clusters
-            
-            # Update centroids
-            for i in range(2):
-                mask = (clusters == i)
-                if mask.any():
-                    centroids[i] = feat_spatial[mask].mean(dim=0)
+        clusters = new_clusters
         
-        # Reshape clusters to spatial dimensions
-        seg_map = clusters.reshape(H, W).float()
+        # Update centroids
+        for i in range(2):
+            mask = (clusters == i)
+            if mask.any():
+                centroids[i] = feat_spatial[mask].mean(dim=0)
+    
+    # Reshape clusters to spatial dimensions
+    seg_map = clusters.reshape(H, W).float()
+    
+    # Compute confidence scores
+    dists = torch.cdist(feat_spatial, centroids)
+    confidence = torch.abs(dists[:, 0] - dists[:, 1])
+    confidence = confidence.reshape(H, W)
+    
+    # Apply confidence thresholding
+    conf_threshold = torch.quantile(confidence[mask_resized.squeeze().bool()], 0.2)
+    uncertain_mask = confidence < conf_threshold
+    
+    # Refine uncertain regions using spatial consistency
+    kernel_size = 3
+    padding = kernel_size // 2
+    for _ in range(2):  # Number of refinement iterations
+        # Compute local majority vote
+        seg_map_padded = F.pad(seg_map.unsqueeze(0).unsqueeze(0), 
+                              (padding, padding, padding, padding), 
+                              mode='reflect')
+        neighbors = F.unfold(seg_map_padded, kernel_size=kernel_size)
+        neighbors = neighbors.reshape(1, kernel_size*kernel_size, H, W)
+        local_sum = neighbors.sum(dim=1).squeeze()
+        local_vote = (local_sum > (kernel_size*kernel_size/2)).float()
         
-        # Add to batch results
-        seg_maps.append(seg_map)
+        # Update uncertain regions
+        seg_map[uncertain_mask] = local_vote[uncertain_mask]
     
-    # Stack back into batch
-    seg_maps = torch.stack(seg_maps)
+    # Final mask application
+    seg_map = seg_map * mask_resized.squeeze()
     
-    # Add channel dimension [B, H, W] -> [B, 1, H, W]
-    seg_maps = seg_maps.unsqueeze(1)
-    
-    return seg_maps
+    return seg_map
 
 def visualize_map_with_augs(
     image_tensors,
@@ -334,18 +347,12 @@ def visualize_map_with_augs(
     reward,
     save_path
 ):
-    """Visualize segmentation maps with augmentations"""
-    # Create a copy of tensors to avoid modifying originals
-    image_tensors = [img.clone() for img in image_tensors]
-    heatmaps = [hmap.clone() for hmap in heatmaps]
-    binary_mask = binary_mask.clone()
-    
-    # Prepare binary mask - ensure correct dimensions
+    # The error is happening here:
     mask_resized = F.interpolate(
-        binary_mask.unsqueeze(0) if binary_mask.dim() == 3 else binary_mask,
+        binary_mask,  # binary_mask needs to be properly shaped
         size=(256, 256),
         mode='nearest'
-    ).squeeze().cpu().numpy()
+    )
     
     n_images = len(image_tensors)
     n_cols = 4
@@ -353,32 +360,32 @@ def visualize_map_with_augs(
     
     plt.figure(figsize=(20, 5*n_rows))
     
+    # Prepare binary mask
+    mask_resized = F.interpolate(
+        binary_mask,
+        size=(256, 256),
+        mode='nearest'
+    ).squeeze().cpu().numpy()
+    
     for idx, (img, hmap) in enumerate(zip(image_tensors, heatmaps)):
-        # Handle image dimensions
         if img.dim() == 4:
             img = img.squeeze(0)
             
         # Resize image
         img_resized = F.interpolate(
-            img.unsqueeze(0) if img.dim() == 3 else img, 
+            img.unsqueeze(0), 
             size=(256, 256),
             mode='bilinear',
             align_corners=False
         ).squeeze(0)
         
-        # Handle heatmap dimensions properly
-        hmap = hmap.unsqueeze(0) if hmap.dim() == 2 else hmap  # Add batch dim if needed
-        hmap = hmap.unsqueeze(1) if hmap.dim() == 3 else hmap  # Add channel dim if needed
-        
         # Resize heatmap and apply mask
         hmap_resized = F.interpolate(
-            hmap,
+            hmap.unsqueeze(0).unsqueeze(0),
             size=(256, 256),
             mode='nearest'
         ).squeeze().detach().cpu().numpy()
-        
-        # Apply mask without in-place operation
-        hmap_resized = hmap_resized * mask_resized
+        hmap_resized = hmap_resized * mask_resized  # Apply binary mask
         
         img_np = img_resized.detach().cpu().permute(1,2,0).numpy()
         
@@ -400,7 +407,7 @@ def visualize_map_with_augs(
         plt.title(f"Binary Map (R={reward:.3f})")
         plt.axis("off")
         
-        # Overlay
+        # Overlay - using resized versions of both image and heatmap
         plt.subplot(n_rows, n_cols, idx*n_cols + 4)
         plt.imshow(img_np)
         plt.imshow(hmap_resized, cmap='gray', alpha=0.6)

@@ -16,11 +16,10 @@ torch.backends.cudnn.allow_tf32 = True
 #  SmallTransformerEncoder (optional if you need it)
 ###############################################################################
 class SmallTransformerEncoder(nn.Module):
-    def __init__(self, embed_dim=2048, num_heads=16):
+    def __init__(self, embed_dim=1024, num_heads=16, num_layers=2, rank=None):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** -0.5
+        self.rank = rank if rank is not None else 0
+        self.device = torch.device(f'cuda:{self.rank}')
         
         # Increased number of layers and added relative position encoding
         self.num_layers = 4  # Increased from 2
@@ -73,7 +72,6 @@ class FPNDecoder(nn.Module):
         super().__init__()
         self.rank = rank if rank is not None else 0
         
-        # Lateral connections with batch norm
         self.lateral_convs = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(in_c, out_channels, kernel_size=1, bias=False),
@@ -83,7 +81,6 @@ class FPNDecoder(nn.Module):
             for in_c in in_channels_list
         ])
         
-        # Channel attention modules
         self.channel_attention = nn.ModuleList([
             nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
@@ -95,7 +92,6 @@ class FPNDecoder(nn.Module):
             for _ in range(2)
         ])
         
-        # Refinement blocks
         self.refine_blocks = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=8, bias=False),
@@ -118,13 +114,12 @@ class FPNDecoder(nn.Module):
         
         self.relu = nn.ReLU(inplace=True)
 
+    @torch.amp.autocast('cuda')
     def forward(self, x1, x2, x3):
-        # Process features from bottom up
         p3 = self.lateral_convs[2](x3)
         p2 = self.lateral_convs[1](x2)
         p1 = self.lateral_convs[0](x1)
 
-        # Top-down pathway with attention and refinement
         p3_up = F.interpolate(p3, size=p2.shape[-2:], mode='bilinear', align_corners=False)
         p2 = self.relu(p2 + p3_up)
         p2 = p2 * self.channel_attention[0](p2)
@@ -135,7 +130,6 @@ class FPNDecoder(nn.Module):
         p1 = p1 * self.channel_attention[1](p1)
         p1 = p1 + self.refine_blocks[1](p1)
 
-        # Final enhancement
         p1 = p1 + self.final_enhance(p1)
         return p1
 
@@ -189,6 +183,25 @@ class CrossSetAttention(nn.Module):
         return out
 
 ###############################################################################
+#  DiceLoss
+###############################################################################
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1.0):
+        super().__init__()
+        self.smooth = smooth
+        
+    def forward(self, predictions, targets):
+        # Flatten predictions and targets
+        predictions = predictions.view(-1)
+        targets = targets.view(-1)
+        
+        intersection = (predictions * targets).sum()
+        dice = (2. * intersection + self.smooth) / (
+            predictions.sum() + targets.sum() + self.smooth
+        )
+        return 1 - dice
+
+###############################################################################
 #  HybridResNet50FPN
 ###############################################################################
 class HybridResNet50FPN(nn.Module):
@@ -199,15 +212,14 @@ class HybridResNet50FPN(nn.Module):
         super().__init__()
         self.rank = rank if rank is not None else 0
         
-        # Initialize ResNet50 backbone
-        weights = models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
-        base_resnet = models.resnet50(weights=weights)
+        # Initialize ResNet50 with FCN segmentation head
+        self.base_model = models.segmentation.fcn_resnet50(
+            weights=models.segmentation.FCN_ResNet50_Weights.DEFAULT if pretrained else None
+        )
+        self.base_model = self.base_model.to(memory_format=torch.channels_last)
         
-        # Start with everything frozen
-        for param in base_resnet.parameters():
-            param.requires_grad = False
-            
-        # Extract layers
+        # Extract backbone layers
+        base_resnet = self.base_model.backbone
         self.stem = nn.Sequential(
             base_resnet.conv1,
             base_resnet.bn1,
@@ -217,13 +229,41 @@ class HybridResNet50FPN(nn.Module):
         self.layer1 = base_resnet.layer1  # 256 channels
         self.layer2 = base_resnet.layer2  # 512 channels
         self.layer3 = base_resnet.layer3  # 1024 channels
+        self.layer4 = base_resnet.layer4  # 2048 channels
         
-        # Store layers in order for gradual unfreezing
-        self.backbone_layers = nn.ModuleList([self.layer3, self.layer2, self.layer1, self.stem])
-        self.current_unfrozen = -1  # No layers unfrozen initially
+        # Use FCN head instead of custom segmentation head
+        self.segmentation_head = self.base_model.classifier
         
-        # Add transformer and FPN
-        self.transformer = SmallTransformerEncoder(embed_dim=2048, num_heads=16)
+        # Better channel adaptation for FCN output
+        self.channel_adapter = nn.Sequential(
+            nn.Conv2d(21, 512, 1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, out_channels, 1)
+        )
+        
+        # Now freeze backbone parameters after layers are initialized
+        self._freeze_backbone()
+        
+        # Initialize optimizer with small learning rate for fine-tuning
+        self.optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=3e-4,
+            weight_decay=0.01,
+            betas=(0.9, 0.999)
+        )
+        
+        # Learning rate scheduler for fine-tuning
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=10000,  # Number of iterations
+            eta_min=1e-6  # Minimum learning rate
+        )
+        
+        # Loss function for fine-tuning
+        self.criterion = DiceLoss(smooth=1.0)  # Better for segmentation tasks
+        
+        # Rest of initialization...
         self.fpn = FPNDecoder(
             in_channels_list=(256, 512, 1024),
             out_channels=out_channels,
@@ -236,166 +276,118 @@ class HybridResNet50FPN(nn.Module):
             num_heads=16
         )
         
+        # Add mixing parameter
+        self.register_buffer('mixing_alpha', torch.tensor(0.8))  # Start with 80% clustering
+        
         # Feature caching
         self.feature_cache = {}
         self.cache_size_limit = 1000
 
-    def unfreeze_next_layer(self):
-        """Unfreeze the next layer from top to bottom"""
-        if self.current_unfrozen < len(self.backbone_layers) - 1:
-            self.current_unfrozen += 1
-            layer = self.backbone_layers[self.current_unfrozen]
-            for param in layer.parameters():
-                param.requires_grad = True
-            return True
-        return False
+    def _freeze_backbone(self):
+        """Freeze all backbone parameters"""
+        print(f"[HybridResNet50FPN] Freezing backbone layers...")
+        for param in self.stem.parameters():
+            param.requires_grad = False
+        for param in self.layer1.parameters():
+            param.requires_grad = False
+        for param in self.layer2.parameters():
+            param.requires_grad = False
+        for param in self.layer3.parameters():
+            param.requires_grad = False
+        for param in self.layer4.parameters():
+            param.requires_grad = False
+        print(f"[HybridResNet50FPN] Backbone frozen: stem, layer1-4 frozen")
+
+    def unfreeze_layer(self, layer_name):
+        """Unfreeze specific layer parameters"""
+        print(f"[HybridResNet50FPN] Unfreezing layer: {layer_name}")
+        layer = getattr(self, layer_name)
+        for param in layer.parameters():
+            param.requires_grad = True
+        print(f"[HybridResNet50FPN] Layer {layer_name} unfrozen successfully")
+            
+    def set_mixing_alpha(self, alpha):
+        """Set mixing ratio between clustering and segmentation"""
+        print(f"[HybridResNet50FPN] Updating mixing alpha: {self.mixing_alpha.item():.3f} -> {alpha:.3f}")
+        self.mixing_alpha = torch.tensor(alpha, device=self.mixing_alpha.device)
 
     @torch.amp.autocast('cuda')
     def forward(self, x):
-        # Check cache
-        cache_key = (x.data_ptr(), x.shape)
-        if cache_key in self.feature_cache:
-            return self.feature_cache[cache_key]
-
+        # Regular feature extraction path
         x = x.contiguous(memory_format=torch.channels_last)
         
-        # Extract features
         x = self.stem(x)
-        x1 = self.layer1(x)    # 256 channels
-        x2 = self.layer2(x1)   # 512 channels
-        x3 = self.layer3(x2)   # 1024 channels
-
-        # Apply transformer to high-level features
-        x3 = self.transformer(x3)
+        x1 = self.layer1(x)
+        x2 = self.layer2(x1)
+        x3 = self.layer3(x2)
+        x4 = self.layer4(x3)
         
-        # FPN decoder
-        p1 = self.fpn(x1, x2, x3)
+        # Get segmentation and clustering features
+        seg_features = self.segmentation_head(x4)
+        seg_features = self.channel_adapter(seg_features)
         
-        # Apply cross-set attention
-        p1 = self.cross_attention(p1)
+        cluster_features = self.fpn(x1, x2, x3)
+        cluster_features = self.cross_attention(cluster_features)
+        
+        # NEW: Compute confidence map from clustering features
+        confidence_map = torch.sigmoid(torch.norm(cluster_features, dim=1, keepdim=True))
+        mixing_weights = self.mixing_alpha * confidence_map
+        
+        # Mix features using confidence-aware weighting
+        mixed_features = (
+            mixing_weights * cluster_features + 
+            (1 - mixing_weights) * F.interpolate(
+                seg_features, 
+                size=cluster_features.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
+        )
+        
+        return mixed_features
 
-        # Cache result
-        if len(self.feature_cache) >= self.cache_size_limit:
-            self.feature_cache.clear()
-        self.feature_cache[cache_key] = p1
-
-        return p1
+    def training_step(self, x, target):
+        """Perform a training step for fine-tuning"""
+        self.optimizer.zero_grad()
+        
+        # Forward pass
+        output = self(x)
+        loss = self.criterion(output, target)
+        
+        # Backward pass
+        loss.backward()
+        
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        
+        # Update weights
+        self.optimizer.step()
+        
+        # Update learning rate
+        self.scheduler.step()
+        
+        return loss.item()
 
 ###############################################################################
 #  FilterWeightingSegmenter
 ###############################################################################
 class FilterWeightingSegmenter(nn.Module):
-    def __init__(self, pretrained=True):
+    """
+    High-level module that outputs a 256-channel feature map from a ResNet50-FPN.
+    """
+    def __init__(self, pretrained=True, rank=None, out_channels=256):
         super().__init__()
-        # Load ResNet50 backbone
-        resnet = models.resnet50(pretrained=pretrained)
+        self.rank = rank if rank is not None else 0
         
-        # Extract layers
-        self.stem = nn.Sequential(
-            resnet.conv1,
-            resnet.bn1,
-            resnet.relu,
-            resnet.maxpool
+        self.feature_extractor = HybridResNet50FPN(
+            pretrained=pretrained, 
+            out_channels=out_channels,
+            rank=self.rank
         )
-        self.layer1 = resnet.layer1  # 256 channels
-        self.layer2 = resnet.layer2  # 512 channels
-        self.layer3 = resnet.layer3  # 1024 channels
-        
-        # Store layers for gradual unfreezing
-        self.backbone_layers = nn.ModuleList([
-            self.stem,
-            self.layer1,
-            self.layer2,
-            self.layer3
-        ])
-        
-        # Add transformer enhancement
-        self.transformer = SmallTransformerEncoder(embed_dim=1024, num_heads=16)
-        
-        # Add FPN decoder
-        self.fpn = FPNDecoder(
-            in_channels_list=(256, 512, 1024),
-            out_channels=256
-        )
-        
-        # Cross attention for global context
-        self.cross_attention = CrossSetAttention(
-            embed_dim=256,
-            num_heads=8
-        )
-        
-        # Segmentation head
-        self.seg_head = nn.Sequential(
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 1, 1)
-        )
-        
-        self.training_mode = 'feature_extract'
-        self.freeze_backbone()  # Start with everything frozen
 
-    def freeze_backbone(self):
-        """Freeze the ResNet50 backbone"""
-        for layer in self.backbone_layers:
-            for param in layer.parameters():
-                param.requires_grad = False
-    
-    def unfreeze_backbone(self):
-        """Unfreeze the ResNet50 backbone for fine-tuning"""
-        for layer in self.backbone_layers:
-            for param in layer.parameters():
-                param.requires_grad = True
-    
+    @torch.amp.autocast('cuda')
     def forward(self, x):
-        # Extract features through backbone
-        x = self.stem(x)
-        f1 = self.layer1(x)    # 256 channels
-        f2 = self.layer2(f1)   # 512 channels
-        f3 = self.layer3(f2)   # 1024 channels
-        
-        # Apply transformer to high-level features
-        f3 = self.transformer(f3)
-        
-        # FPN decoder
-        features = self.fpn(f1, f2, f3)
-        
-        # Apply cross attention
-        features = self.cross_attention(features)
-        
-        if self.training_mode == 'feature_extract':
-            return features
-        else:
-            seg_logits = self.seg_head(features)
-            return features, seg_logits
-    
-    def set_training_mode(self, mode):
-        """Set whether to do feature extraction or fine-tuning"""
-        assert mode in ['feature_extract', 'finetune']
-        self.training_mode = mode
-        
-        if mode == 'feature_extract':
-            self.eval()  # Set to eval mode for feature extraction
-            # Freeze all parameters
-            self.freeze_backbone()
-            for param in self.seg_head.parameters():
-                param.requires_grad = False
-        else:
-            self.train()  # Set to train mode for fine-tuning
-            # Unfreeze segmentation head only (backbone stays frozen initially)
-            for param in self.seg_head.parameters():
-                param.requires_grad = True
-    
-    def unfreeze_next_layer(self):
-        """Unfreeze the next frozen layer in the backbone, returns True if a layer was unfrozen"""
-        for layer in self.backbone_layers:
-            # Check if layer is frozen
-            if not any(p.requires_grad for p in layer.parameters()):
-                # Unfreeze this layer
-                for param in layer.parameters():
-                    param.requires_grad = True
-                return True
-        return False  # No more layers to unfreeze
+        return self.feature_extractor(x)
 
 ###############################################################################
 #  DDPFeatureExtractor
@@ -404,13 +396,13 @@ class DDPFeatureExtractor(nn.Module):
     """
     Wrapper class for FilterWeightingSegmenter to support DDP training
     """
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, out_channels=256):
         super().__init__()
-        self.feature_extractor = FilterWeightingSegmenter(pretrained=pretrained)
+        self.feature_extractor = FilterWeightingSegmenter(
+            pretrained=pretrained,
+            out_channels=out_channels
+        )
 
     @torch.amp.autocast('cuda')
     def forward(self, x):
         return self.feature_extractor(x)
-        
-    def set_training_mode(self, mode):
-        self.feature_extractor.set_training_mode(mode)
