@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+import os
+import sys
+# os.chdir('/home/sks6nv/Projects/PPO/segment-anything-2')
+# sys.path.append('/home/sks6nv/Projects/PPO/segment-anything-2')
+
+# Imports
+import torch
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+import cv2
+import numpy as np
+from torch.optim import AdamW
+from torch.amp import GradScaler, autocast
+
+def main():
+    def create_synthetic_batch(size=(512, 512)):
+        img = np.zeros((size[0], size[1], 3), dtype=np.uint8)
+        img[:, :] = np.random.randint(0, 30, size=3)
+        
+        masks = []
+        points = []
+        
+        num_shapes = np.random.randint(1, 4)
+        
+        for _ in range(num_shapes):
+            mask = np.zeros((size[0], size[1]), dtype=np.uint8)
+            center_x = np.random.randint(50, size[1]-50)
+            center_y = np.random.randint(50, size[0]-50)
+            
+            if np.random.random() > 0.5:
+                radius = np.random.randint(20, 50)
+                cv2.circle(mask, (center_x, center_y), radius, 1, -1)
+                color = np.random.randint(50, 256, size=3)
+                cv2.circle(img, (center_x, center_y), radius, color.tolist(), -1)
+            else:
+                width = np.random.randint(40, 100)
+                height = np.random.randint(40, 100)
+                x1 = center_x - width//2
+                y1 = center_y - height//2
+                cv2.rectangle(mask, (x1, y1), (x1+width, y1+height), 1, -1)
+                color = np.random.randint(50, 256, size=3)
+                cv2.rectangle(img, (x1, y1), (x1+width, y1+height), color.tolist(), -1)
+            
+            coords = np.argwhere(mask > 0)
+            point_idx = np.random.randint(len(coords))
+            point = coords[point_idx]
+            
+            masks.append(mask)
+            points.append([[point[1], point[0]]])
+        
+        return img, np.array(masks), np.array(points), np.ones((len(masks), 1))
+
+    # Setup device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    # Setup paths
+    config_file = "configs/sam2.1/sam2.1_hiera_t.yaml"  # Config file path for hiera tiny
+    checkpoint = "checkpoints/sam2.1_hiera_tiny.pt"
+    print(f"Loading checkpoint from: {checkpoint}")
+    
+    # Build model
+    print("Building model...")
+    model = build_sam2(config_file=config_file, ckpt_path=checkpoint, device=device)
+    predictor = SAM2ImagePredictor(model)
+    print("Model built successfully")
+    
+    # Enable training
+    print("Enabling training mode...")
+    predictor.model.sam_mask_decoder.train(True)
+    predictor.model.sam_prompt_encoder.train(True)
+    
+    # Setup optimizer and scaler
+    optimizer = AdamW(predictor.model.parameters(), lr=1e-5, weight_decay=4e-5)
+    scaler = GradScaler('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Training loop
+    num_iterations = 1000  # Reduced for testing
+    running_loss = 0.0
+    
+    print(f"Starting training for {num_iterations} iterations...")
+    
+    for itr in range(num_iterations):
+        # Generate synthetic data
+        image, gt_masks, input_points, input_label = create_synthetic_batch()
+        
+        if gt_masks.size == 0:
+            continue
+            
+        # Set image in predictor
+        predictor.set_image(image)
+        
+        # Prepare prompts
+        mask_input, unnorm_coords, pts_labels, _ = predictor._prep_prompts(
+            input_points, input_label, box=None, mask_logits=None, normalize_coords=True
+        )
+        
+        # Encode prompts
+        sparse_emb, dense_emb = predictor.model.sam_prompt_encoder(
+            points=(unnorm_coords, pts_labels), boxes=None, masks=None
+        )
+        
+        batched_mode = unnorm_coords.shape[0] > 1
+        high_res_feats = [feat_level[-1].unsqueeze(0) for feat_level in predictor._features["high_res_feats"]]
+        
+        with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+            # Run mask decoder
+            low_res_masks, prd_scores, _, _ = predictor.model.sam_mask_decoder(
+                image_embeddings=predictor._features["image_embed"][-1].unsqueeze(0),
+                image_pe=predictor.model.sam_prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_emb,
+                dense_prompt_embeddings=dense_emb,
+                multimask_output=False,  # Changed to False to get single mask
+                repeat_image=batched_mode,
+                high_res_features=high_res_feats,
+            )
+            
+            # Post-process masks
+            prd_masks = predictor._transforms.postprocess_masks(low_res_masks, predictor._orig_hw[-1])
+            
+            # Calculate losses
+            prd_prob = torch.sigmoid(prd_masks)  # Shape: [B, 1, H, W]
+            gt = torch.tensor(gt_masks, device=device).float()  # Shape: [B, H, W]
+            gt = gt.unsqueeze(1)  # Shape: [B, 1, H, W]
+            
+            # Ensure shapes match
+            if gt.shape != prd_prob.shape:
+                gt = torch.nn.functional.interpolate(gt, size=prd_prob.shape[-2:], mode='nearest')
+            
+            # Segmentation loss
+            seg_loss = (-gt * torch.log(prd_prob + 1e-5) - (1-gt) * torch.log((1-prd_prob) + 1e-5)).mean()
+            
+            # IoU score loss
+            intersection = (gt * (prd_prob > 0.5).float()).sum(dim=(2,3))
+            union = gt.sum(dim=(2,3)) + (prd_prob > 0.5).float().sum(dim=(2,3)) - intersection
+            iou = intersection / (union + 1e-6)
+            score_loss = torch.abs(prd_scores - iou).mean()
+            
+            loss = seg_loss + 0.05 * score_loss
+        
+        # Optimization step
+        scaler.scale(loss).backward()
+        torch.nn.utils.clip_grad_norm_(predictor.model.parameters(), max_norm=2.0)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+        
+        # Update running loss and print progress
+        running_loss += loss.item()
+        if itr % 10 == 0:
+            avg_loss = running_loss / 10
+            print(f"Iteration {itr}/{num_iterations}, Loss: {avg_loss:.4f}")
+            running_loss = 0.0
+            
+            # Save checkpoint every 100 iterations
+            if itr % 100 == 0:
+                checkpoint_path = f"sam2_finetuned_iter_{itr}.pt"
+                torch.save({
+                    'iteration': itr,
+                    'model_state_dict': predictor.model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': loss,
+                }, checkpoint_path)
+                print(f"Saved checkpoint to {checkpoint_path}")
+    
+    print("Training completed!")
+    # Save final model
+    final_checkpoint = "sam2_finetuned_final.pt"
+    torch.save({
+        'iteration': num_iterations,
+        'model_state_dict': predictor.model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+    }, final_checkpoint)
+    print(f"Saved final model to {final_checkpoint}")
+
+if __name__ == "__main__":
+    main()
