@@ -23,12 +23,14 @@ from utils import (
     compute_consistency_reward,
     compute_boundary_strength,
     compute_local_coherence,
-    compute_segmentation_map,
     visualize_map_with_augs,
     MomentumEncoder
 )
 from custom_ppo import PPO  # Your PPO code
-from feature_extract import FilterWeightingSegmenter  # This needs to be added back
+from feature_extract import (
+    FilterWeightingSegmenter,
+    compute_segmentation_map
+)
 
 # At the top of train.py, after imports
 binary_mask = torch.from_numpy(np.load('/home/sks6nv/Projects/PPO/unsupervised_finetune_resnet50-SAM2/cursor_ppo/binary_image.npy'))
@@ -41,14 +43,12 @@ binary_mask = F.interpolate(
 # Update these parameters in train.py
 WARMUP_STEPS = 64  # Increased warmup for transformer architecture
 UNFREEZE_INTERVALS = {
-    64: ('layer4', 0.8),    # Start with final transformer blocks and adapter
-    128: ('layer3', 0.6),   # Unfreeze later transformer blocks
-    200: ('layer2', 0.4),   # Unfreeze middle transformer blocks, was 
-    384: ('layer1', 0.2),   # Unfreeze patch embedding and early blocks
+    64: ('layer4', 0.8),    # Keep final layers frozen longer
+    65: ('layer3', 0.8),    # Increase alpha values
+    66: ('layer2', 0.8),    # Remove layer1 unfreezing
 }
+# Ex: .4 = 40% PPO + 60% SAM2
 
-# Increase segmentation warmup for transformer
-SEGMENTATION_WARMUP_STEPS = 32  # Increased from 24
 
 def setup_ddp(rank, world_size):
     """Setup DDP with increased timeout and better error handling"""
@@ -386,13 +386,11 @@ class FeatureWeightingEnv(gym.Env):
             boundary_reward = compute_boundary_strength(orig_features)
             coherence_reward = compute_local_coherence(orig_features)
 
-            # Gradually increase consistency weight
-            consistency_weight = min(0.6, 0.3 + self.total_steps / 10000)
+            # Use fixed weights
             reward = (
-                (0.4 - consistency_weight/2) * diversity_reward +
-                consistency_weight * consistency_reward +  
-                0.1 * boundary_reward +
-                0.1 * coherence_reward
+                0.5 * diversity_reward +      # Increase diversity weight
+                0.3 * consistency_reward +    # Reduce consistency weight
+                0.2 * boundary_reward        # Remove coherence reward entirely
             )
 
         # Store metrics
@@ -419,6 +417,17 @@ class FeatureWeightingEnv(gym.Env):
         obs = self._get_observation()
         done = False
         info = {}
+
+        if self.total_steps >= WARMUP_STEPS:
+            # Fix: Access feature_extractor through .module for DDP model
+            if isinstance(self.segmenter, torch.nn.parallel.DistributedDataParallel):
+                if hasattr(self.segmenter.module.feature_extractor, 'latest_segmentation'):
+                    sam2_segmentation = self.segmenter.module.feature_extractor.latest_segmentation
+                    self.next_clustering_target = sam2_segmentation
+            else:
+                if hasattr(self.segmenter.feature_extractor, 'latest_segmentation'):
+                    sam2_segmentation = self.segmenter.feature_extractor.latest_segmentation
+                    self.next_clustering_target = sam2_segmentation
 
         return obs, reward, done, info
 
@@ -487,10 +496,13 @@ def train_ddp(rank, world_size, processed_samples):
         # Create environment
         feature_extractor = FilterWeightingSegmenter(
             pretrained=True,
-            rank=rank,  # Pass rank to ensure correct device placement
+            rank=rank,
             out_channels=256
         ).to(device)
         
+        # Set binary mask
+        feature_extractor.feature_extractor.set_binary_mask(binary_mask.to(device))
+
         ddp_feature_extractor = DDP(
             feature_extractor,
             device_ids=[rank],

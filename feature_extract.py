@@ -15,6 +15,115 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+# Add the function definition after the imports but before any classes
+def compute_segmentation_map(w_feats: torch.Tensor, binary_mask: torch.Tensor, n_iters: int = 3) -> torch.Tensor:
+    """
+    Compute binary segmentation map using improved k-means clustering with:
+    1. Better centroid initialization
+    2. Multiple refinement iterations
+    3. Spatial regularization
+    4. Confidence thresholding
+    
+    Args:
+        w_feats: Weighted feature tensor [B, C, H, W]
+        binary_mask: Binary mask tensor [1, 1, H, W]
+        n_iters: Number of k-means iterations
+    Returns:
+        Binary segmentation map tensor [H, W]
+    """
+    # Resize binary mask to match feature size
+    mask_resized = F.interpolate(
+        binary_mask,
+        size=(w_feats.shape[2], w_feats.shape[3]),
+        mode='nearest'
+    )
+    
+    # Apply binary mask and normalize features
+    w_feats = w_feats * mask_resized
+    feat_flat = w_feats.squeeze(0).permute(1, 2, 0)  # [H, W, C]
+    feat_flat = F.normalize(feat_flat, dim=-1)
+    
+    # Add spatial coordinates for regularization
+    H, W = w_feats.shape[2:]
+    y_coords = torch.linspace(-1, 1, H, device=w_feats.device)
+    x_coords = torch.linspace(-1, 1, W, device=w_feats.device)
+    yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
+    spatial_coords = torch.stack([yy, xx], dim=-1) * 0.1  # Scale factor for spatial influence
+    
+    # Combine features with spatial coordinates
+    feat_spatial = torch.cat([
+        feat_flat,
+        spatial_coords
+    ], dim=-1)
+    
+    # Flatten for clustering
+    N = H * W
+    D = feat_spatial.shape[-1]
+    feat_spatial = feat_spatial.reshape(N, D)
+    
+    # Initialize centroids using k-means++
+    centroids = torch.zeros((2, D), device=w_feats.device)
+    
+    # First centroid: maximum feature response
+    feat_norms = torch.norm(feat_flat.reshape(N, -1), dim=1)
+    first_idx = torch.argmax(feat_norms)
+    centroids[0] = feat_spatial[first_idx]
+    
+    # Second centroid: furthest point from first
+    dists = torch.norm(feat_spatial - centroids[0], dim=1)
+    second_idx = torch.argmax(dists)
+    centroids[1] = feat_spatial[second_idx]
+    
+    # K-means iterations
+    clusters = None
+    for _ in range(n_iters):
+        # Compute distances and assign clusters
+        dists = torch.cdist(feat_spatial, centroids)
+        new_clusters = dists.argmin(dim=1)
+        
+        if clusters is not None and torch.all(new_clusters == clusters):
+            break
+            
+        clusters = new_clusters
+        
+        # Update centroids
+        for i in range(2):
+            mask = (clusters == i)
+            if mask.any():
+                centroids[i] = feat_spatial[mask].mean(dim=0)
+    
+    # Reshape clusters to spatial dimensions
+    seg_map = clusters.reshape(H, W).float()
+    
+    # Compute confidence scores
+    dists = torch.cdist(feat_spatial, centroids)
+    confidence = torch.abs(dists[:, 0] - dists[:, 1])
+    confidence = confidence.reshape(H, W)
+    
+    # Apply confidence thresholding
+    conf_threshold = torch.quantile(confidence[mask_resized.squeeze().bool()], 0.2)
+    uncertain_mask = confidence < conf_threshold
+    
+    # Refine uncertain regions using spatial consistency
+    kernel_size = 3
+    padding = kernel_size // 2
+    for _ in range(2):  # Number of refinement iterations
+        # Compute local majority vote
+        seg_map_padded = F.pad(seg_map.unsqueeze(0).unsqueeze(0), 
+                              (padding, padding, padding, padding), 
+                              mode='reflect')
+        neighbors = F.unfold(seg_map_padded, kernel_size=kernel_size)
+        neighbors = neighbors.reshape(1, kernel_size*kernel_size, H, W)
+        local_sum = neighbors.sum(dim=1).squeeze()
+        local_vote = (local_sum > (kernel_size*kernel_size/2)).float()
+        
+        # Update uncertain regions
+        seg_map[uncertain_mask] = local_vote[uncertain_mask]
+    
+    # Final mask application
+    seg_map = seg_map * mask_resized.squeeze()
+    
+    return seg_map
 
 ###############################################################################
 #  CrossSetAttention
@@ -130,10 +239,10 @@ class SAM2FeatureExtractor(nn.Module):
         # Move model to correct device immediately after creation
         self.model = build_sam2(config_file=config_file, ckpt_path=checkpoint)
         self.model.to(self.device)
-        
-        # We only need the image encoder
+
+
         self.image_encoder = self.model.image_encoder
-        self.image_encoder.to(self.device)
+        self.mask_decoder = self.model.sam_mask_decoder  # It's 'sam_mask_decoder' not 'decoder'
 
         # Get encoder channels - use fixed size since SAM2 uses 256 channels
         encoder_channels = 256
@@ -150,8 +259,8 @@ class SAM2FeatureExtractor(nn.Module):
         
         # Learning rate configuration
         self.lr_config = {
-            'early_layers': 1e-6,  # Early layers
-            'late_layers': 5e-6,   # Late layers
+            'early_layers': 1e-5,  # Early layers
+            'late_layers': 1e-5,   # Late layers
             'adapter': 1e-5        # Feature adapter
         }
         
@@ -185,6 +294,9 @@ class SAM2FeatureExtractor(nn.Module):
         #     )
         # )
 
+        # Add binary_mask as a buffer
+        self.register_buffer('binary_mask', None)
+
     def _freeze_all(self):
         """Freeze all parameters initially"""
         print(f"[SAM2FeatureExtractor] Freezing all parameters...")
@@ -198,33 +310,44 @@ class SAM2FeatureExtractor(nn.Module):
         """Unfreeze layer and update optimizer"""
         print(f"[SAM2FeatureExtractor] Unfreezing layer: {layer_name}")
         
+        # Access the actual trunk (Hiera backbone) of SAM2
+        trunk = self.image_encoder.trunk
+        
         # Set learning rate based on layer
         if layer_name in ["layer1", "layer2"]:
             current_lr = self.lr_config['early_layers']
         else:  # layer3 or layer4
             current_lr = self.lr_config['late_layers']
         
-        if hasattr(self.image_encoder, 'backbone'):
-            backbone = self.image_encoder.backbone
-            
-            # Unfreeze requested layer
-            if layer_name in ["layer1", "layer2"]:
-                if layer_name == "layer1":
-                    for param in backbone.patch_embed.parameters():
-                        param.requires_grad = True
-                for param in backbone.stages[int(layer_name[-1])-1].parameters():
+        # Map layer names to Hiera blocks
+        # Note: layer1 (patch_embed, blocks[0,1]) stays permanently frozen
+        layer_to_block = {
+            'layer1': ['patch_embed', 'blocks.0', 'blocks.1'],  # Stays frozen (earliest visual features)
+            'layer2': ['blocks.2', 'blocks.3'],                 # Unfrozen at step 512
+            'layer3': ['blocks.4', 'blocks.5'],                 # Unfrozen at step 128
+            'layer4': ['blocks.6', 'blocks.7']                  # Unfrozen at step 32
+        }
+        
+        # Unfreeze corresponding blocks
+        blocks_to_unfreeze = layer_to_block[layer_name]
+        for block_name in blocks_to_unfreeze:
+            if block_name == 'patch_embed':
+                for param in trunk.patch_embed.parameters():
                     param.requires_grad = True
-            else:  # layer3 or layer4
-                stage_idx = int(layer_name[-1])-1
-                if stage_idx < len(backbone.stages):
-                    for param in backbone.stages[stage_idx].parameters():
-                        param.requires_grad = True
-                    if layer_name == "layer4":
-                        for param in self.feature_adapter.parameters():
-                            param.requires_grad = True
-
-            # Reset optimizer with new parameter groups
-            self._setup_optimizer()
+            else:
+                block_idx = int(block_name.split('.')[1])
+                for param in trunk.blocks[block_idx].parameters():
+                    param.requires_grad = True
+            
+        # Also unfreeze corresponding FPN (neck) layers
+        # Note: neck.convs[0] (corresponding to layer1) stays frozen
+        stage_idx = int(layer_name[-1])-1
+        if stage_idx < len(self.image_encoder.neck.convs):
+            for param in self.image_encoder.neck.convs[stage_idx].parameters():
+                param.requires_grad = True
+        
+        # Reset optimizer with new parameter groups
+        self._setup_optimizer()
         
         print(f"[SAM2FeatureExtractor] Layer {layer_name} unfrozen with learning rate: {current_lr:.1e}")
 
@@ -232,6 +355,13 @@ class SAM2FeatureExtractor(nn.Module):
         """Set the mixing alpha value for feature blending"""
         self.mixing_alpha = torch.tensor(alpha)
         
+    def set_binary_mask(self, mask):
+        """Set the binary mask buffer"""
+        if self.binary_mask is None or (self.binary_mask.shape != mask.shape):
+            self.register_buffer('binary_mask', mask)
+        else:
+            self.binary_mask.copy_(mask)
+
     @torch.amp.autocast('cuda')
     def forward(self, x, targets=None, augment=False):
         """Forward pass with optional augmentation"""
@@ -270,29 +400,21 @@ class SAM2FeatureExtractor(nn.Module):
         
         return self._forward_chunk(x, targets)
 
-    def _forward_chunk(self, x, targets=None):
-        # Use memory efficient attention for forward pass
+    def _forward_chunk(self, x, targets=None, sample_indices=None):
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
             # Get features from image encoder
             features_dict = self.image_encoder(x)
             
             # Get high and low level features
-            high_level_features = features_dict['backbone_fpn'][2]  # [B, 256, 16, 16]
-            low_level_features = features_dict['backbone_fpn'][0]   # [B, 256, 64, 64]
-            vision_feats = features_dict['vision_features']         # [B, 256, 16, 16]
+            high_level_features = features_dict['backbone_fpn'][2]
+            low_level_features = features_dict['backbone_fpn'][0]
+            vision_feats = features_dict['vision_features']
             
             # Add vision features to high level features
             high_level_features = high_level_features + vision_feats
             
             # Process through adapter
             adapted_high = self.feature_adapter(high_level_features)
-            
-            # Match channels if needed
-            if low_level_features.shape[1] != adapted_high.shape[1]:
-                low_level_features = F.conv2d(
-                    low_level_features,
-                    torch.ones(adapted_high.shape[1], low_level_features.shape[1], 1, 1, device=self.device) / low_level_features.shape[1]
-                )
             
             # Match spatial dimensions
             if low_level_features.shape[-2:] != adapted_high.shape[-2:]:
@@ -303,16 +425,32 @@ class SAM2FeatureExtractor(nn.Module):
                     align_corners=False
                 )
             
-            # Mix features using current alpha
-            mixing_alpha = self.mixing_alpha.to(adapted_high.device)
-            mixed_features = (
-                mixing_alpha * adapted_high + 
-                (1 - self.mixing_alpha) * low_level_features
-            )
+            # Mix features
+            mixed_features = (adapted_high + low_level_features) / 2.0
             
             loss = None
             if targets is not None:
-                loss = self.criterion(mixed_features, targets)
+                # Get masks from decoder
+                masks, iou_pred = self.mask_decoder(
+                    image_embeddings=mixed_features,
+                    image_pe=self.model.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=torch.zeros(mixed_features.shape[0], 0, 256).to(self.device),
+                    dense_prompt_embeddings=torch.zeros_like(mixed_features),
+                    multimask_output=False
+                )
+                
+                self.latest_segmentation = {
+                    'masks': masks.squeeze(1),
+                    'indices': sample_indices
+                }
+                
+                # CHOOSE instead of mix based on probability
+                if torch.rand(1).item() < self.mixing_alpha:  # Ex: 15% chance use PPO
+                    chosen_labels = targets  # Use PPO's k-means clustering
+                else:  # Ex: 85% chance use SAM2
+                    chosen_labels = self.latest_segmentation['masks']  # Use SAM2's decoder output
+                
+                loss = self.criterion(mixed_features, chosen_labels)
             
             return mixed_features if loss is None else (mixed_features, loss)
 
@@ -416,6 +554,22 @@ class SAM2FeatureExtractor(nn.Module):
         self.optimizer.step()
         
         return avg_loss
+
+    def _setup_optimizer(self):
+        """Setup optimizer with current trainable parameters"""
+        # Get all trainable parameters
+        param_groups = [
+            {
+                'params': list(self.image_encoder.parameters()),
+                'lr': self.lr_config['late_layers']
+            },
+            {
+                'params': self.feature_adapter.parameters(),
+                'lr': self.lr_config['adapter']
+            }
+        ]
+        
+        self.optimizer = torch.optim.AdamW(param_groups)
 
 ###############################################################################
 #  FilterWeightingSegmenter

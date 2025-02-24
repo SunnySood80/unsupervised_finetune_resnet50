@@ -28,11 +28,33 @@ class MomentumEncoder:
                 rank=0 if device is None else device.index,
                 out_channels=256  # Match the output channels from SAM2
             )
+            
+            # Copy binary mask from original model if it exists
+            if hasattr(model, 'module'):
+                source_model = model.module
+            else:
+                source_model = model
+                
+            if hasattr(source_model.feature_extractor, 'binary_mask'):
+                self.ema_model.feature_extractor.set_binary_mask(
+                    source_model.feature_extractor.binary_mask
+                )
+                
+            # Get state dict excluding binary_mask
+            state_dict = source_model.state_dict()
+            # Filter out binary_mask from state dict
+            filtered_state_dict = {
+                k: v for k, v in state_dict.items() 
+                if not k.endswith('binary_mask')
+            }
+            
+            # Load filtered state dict
+            self.ema_model.load_state_dict(filtered_state_dict, strict=False)
+            
         else:
             print("Creating momentum encoder for standard model...")
             # Create new instance with same parameters as original model
             if hasattr(model, 'module'):
-                # Handle DDP wrapped model
                 base_model = model.module
             else:
                 base_model = model
@@ -42,11 +64,15 @@ class MomentumEncoder:
                 pretrained=True
             )
             
-        # Copy weights and move to correct device
-        if hasattr(model, 'module'):
-            self.ema_model.load_state_dict(model.module.state_dict())
-        else:
-            self.ema_model.load_state_dict(model.state_dict())
+            # Get state dict excluding binary_mask
+            state_dict = base_model.state_dict()
+            filtered_state_dict = {
+                k: v for k, v in state_dict.items() 
+                if not k.endswith('binary_mask')
+            }
+            
+            # Load filtered state dict
+            self.ema_model.load_state_dict(filtered_state_dict, strict=False)
             
         self.ema_model = self.ema_model.to(self.device)
         self.ema_model.eval()
@@ -226,115 +252,6 @@ def compute_local_coherence(features: torch.Tensor, kernel_size: int = 3) -> flo
     
     coherence = -F.mse_loss(features, local_mean)
     return float(coherence.item())
-
-def compute_segmentation_map(w_feats: torch.Tensor, binary_mask: torch.Tensor, n_iters: int = 3) -> torch.Tensor:
-    """
-    Compute binary segmentation map using improved k-means clustering with:
-    1. Better centroid initialization
-    2. Multiple refinement iterations
-    3. Spatial regularization
-    4. Confidence thresholding
-    
-    Args:
-        w_feats: Weighted feature tensor [B, C, H, W]
-        binary_mask: Binary mask tensor [1, 1, H, W]
-        n_iters: Number of k-means iterations
-    Returns:
-        Binary segmentation map tensor [H, W]
-    """
-    # Resize binary mask to match feature size
-    mask_resized = F.interpolate(
-        binary_mask,
-        size=(w_feats.shape[2], w_feats.shape[3]),
-        mode='nearest'
-    )
-    
-    # Apply binary mask and normalize features
-    w_feats = w_feats * mask_resized
-    feat_flat = w_feats.squeeze(0).permute(1, 2, 0)  # [H, W, C]
-    feat_flat = F.normalize(feat_flat, dim=-1)
-    
-    # Add spatial coordinates for regularization
-    H, W = w_feats.shape[2:]
-    y_coords = torch.linspace(-1, 1, H, device=w_feats.device)
-    x_coords = torch.linspace(-1, 1, W, device=w_feats.device)
-    yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
-    spatial_coords = torch.stack([yy, xx], dim=-1) * 0.1  # Scale factor for spatial influence
-    
-    # Combine features with spatial coordinates
-    feat_spatial = torch.cat([
-        feat_flat,
-        spatial_coords
-    ], dim=-1)
-    
-    # Flatten for clustering
-    N = H * W
-    D = feat_spatial.shape[-1]
-    feat_spatial = feat_spatial.reshape(N, D)
-    
-    # Initialize centroids using k-means++
-    centroids = torch.zeros((2, D), device=w_feats.device)
-    
-    # First centroid: maximum feature response
-    feat_norms = torch.norm(feat_flat.reshape(N, -1), dim=1)
-    first_idx = torch.argmax(feat_norms)
-    centroids[0] = feat_spatial[first_idx]
-    
-    # Second centroid: furthest point from first
-    dists = torch.norm(feat_spatial - centroids[0], dim=1)
-    second_idx = torch.argmax(dists)
-    centroids[1] = feat_spatial[second_idx]
-    
-    # K-means iterations
-    clusters = None
-    for _ in range(n_iters):
-        # Compute distances and assign clusters
-        dists = torch.cdist(feat_spatial, centroids)
-        new_clusters = dists.argmin(dim=1)
-        
-        if clusters is not None and torch.all(new_clusters == clusters):
-            break
-            
-        clusters = new_clusters
-        
-        # Update centroids
-        for i in range(2):
-            mask = (clusters == i)
-            if mask.any():
-                centroids[i] = feat_spatial[mask].mean(dim=0)
-    
-    # Reshape clusters to spatial dimensions
-    seg_map = clusters.reshape(H, W).float()
-    
-    # Compute confidence scores
-    dists = torch.cdist(feat_spatial, centroids)
-    confidence = torch.abs(dists[:, 0] - dists[:, 1])
-    confidence = confidence.reshape(H, W)
-    
-    # Apply confidence thresholding
-    conf_threshold = torch.quantile(confidence[mask_resized.squeeze().bool()], 0.2)
-    uncertain_mask = confidence < conf_threshold
-    
-    # Refine uncertain regions using spatial consistency
-    kernel_size = 3
-    padding = kernel_size // 2
-    for _ in range(2):  # Number of refinement iterations
-        # Compute local majority vote
-        seg_map_padded = F.pad(seg_map.unsqueeze(0).unsqueeze(0), 
-                              (padding, padding, padding, padding), 
-                              mode='reflect')
-        neighbors = F.unfold(seg_map_padded, kernel_size=kernel_size)
-        neighbors = neighbors.reshape(1, kernel_size*kernel_size, H, W)
-        local_sum = neighbors.sum(dim=1).squeeze()
-        local_vote = (local_sum > (kernel_size*kernel_size/2)).float()
-        
-        # Update uncertain regions
-        seg_map[uncertain_mask] = local_vote[uncertain_mask]
-    
-    # Final mask application
-    seg_map = seg_map * mask_resized.squeeze()
-    
-    return seg_map
 
 def visualize_map_with_augs(
     image_tensors,
