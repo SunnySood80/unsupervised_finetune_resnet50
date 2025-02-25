@@ -41,13 +41,13 @@ binary_mask = F.interpolate(
 )  # Remove .to('cuda') here - we'll move it to the correct device per process
 
 # Update these parameters in train.py
-WARMUP_STEPS = 64  # Increased warmup for transformer architecture
+WARMUP_STEPS = 64
 UNFREEZE_INTERVALS = {
-    64: ('layer4', 0.8),    # Keep final layers frozen longer
-    65: ('layer3', 0.8),    # Increase alpha values
-    66: ('layer2', 0.8),    # Remove layer1 unfreezing
+    64: ('layer4', 0.2),    # Use SAM2 path 90% of the time, PPO/kmeans 10% of the time
+    128: ('layer3', 0.5),    # Same ratio with layer3 unfrozen
+    356: ('layer2', 0.9),    # Same ratio with layer2 unfrozen
 }
-# Ex: .4 = 40% PPO + 60% SAM2
+# Alpha = 0.9 means 90% SAM2 path, 10% PPO/k-means path
 
 
 def setup_ddp(rank, world_size):
@@ -170,7 +170,10 @@ class FeatureWeightingEnv(gym.Env):
         self.history_length = history_length
         self.visualize = visualize
         self.writer = writer  # Store tensorboard writer
-
+        
+        # Fix: use a regular attribute instead of register_buffer
+        self.path_selection_alpha = 0.0  # Start with no SAM2 influence
+        
         # Add these attributes for rendering
         self.current_sample_idx = 0
         self.cached_images = {}
@@ -188,7 +191,7 @@ class FeatureWeightingEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=self.obs_shape,
+            shape=(self.feature_dim * self.history_length + 10,),  # +10 for SAM2 info
             dtype=np.float32
         )
         self.action_space = spaces.Box(
@@ -301,25 +304,55 @@ class FeatureWeightingEnv(gym.Env):
 
     def _get_observation(self):
         """Get stacked weight history as observation"""
+        # Original code for weight history - unchanged dimensions for consistency
         obs = torch.cat(self.weight_history, dim=0)
+        
+        # Fix: Only include SAM2 info if available after warmup, but keep dimensions consistent
+        sam2_info = torch.zeros(10, device=self.device)  # Placeholder with fixed size
+        
+        # After warmup, try to get real SAM2 decoder output
+        if self.total_steps >= WARMUP_STEPS:
+            try:
+                if isinstance(self.segmenter, torch.nn.parallel.DistributedDataParallel):
+                    if hasattr(self.segmenter.module.feature_extractor, 'latest_segmentation'):
+                        # Extract properties but maintain vector size
+                        sam2_seg = self.segmenter.module.feature_extractor.latest_segmentation['masks']
+                        sam2_info[0] = sam2_seg.mean()  # Average activation
+                        sam2_info[1] = sam2_seg.std()   # Variation in segmentation
+                        sam2_info[2] = (sam2_seg > 0.5).float().mean()  # Binary coverage
+                else:
+                    if hasattr(self.segmenter.feature_extractor, 'latest_segmentation'):
+                        sam2_seg = self.segmenter.feature_extractor.latest_segmentation['masks']
+                        sam2_info[0] = sam2_seg.mean()
+                        sam2_info[1] = sam2_seg.std()
+                        sam2_info[2] = (sam2_seg > 0.5).float().mean()
+            except Exception as e:
+                # If there's an error, just use the zero placeholder (already set above)
+                pass
+        
+        # Always include fixed-size sam2_info to maintain consistent observation dimensions
+        obs = torch.cat([obs, sam2_info], dim=0)
+        
         return obs.cpu().numpy()
 
     def step(self, action):
+        print(f"[DEBUG] Starting step with action shape: {action.shape}")
+        
         self.total_steps += 1
         
-        # Check if we should unfreeze layers or update mixing ratio
+        # Check if we should unfreeze layers or update path selection ratio
         if self.total_steps >= WARMUP_STEPS:
             for step_threshold, (layer, alpha) in UNFREEZE_INTERVALS.items():
                 if self.total_steps == step_threshold:
                     if isinstance(self.segmenter, torch.nn.parallel.DistributedDataParallel):
                         self.segmenter.module.feature_extractor.unfreeze_layer(layer)
-                        self.segmenter.module.feature_extractor.set_mixing_alpha(alpha)
+                        self.segmenter.module.feature_extractor.set_path_selection_alpha(alpha)  # Renamed for clarity
                     else:
                         self.segmenter.feature_extractor.unfreeze_layer(layer)
-                        self.segmenter.feature_extractor.set_mixing_alpha(alpha)
+                        self.segmenter.feature_extractor.set_path_selection_alpha(alpha)  # Renamed for clarity
                     
                     if self.writer is not None:
-                        self.writer.add_scalar('Training/mixing_alpha', alpha, self.total_steps)
+                        self.writer.add_scalar('Training/path_selection_alpha', alpha, self.total_steps)
                         self.writer.add_text('Training/unfrozen_layer', layer, self.total_steps)
         
         # Update weights using momentum encoder
@@ -345,11 +378,49 @@ class FeatureWeightingEnv(gym.Env):
             
             orig_features = self._extract_features(sample_indices)
             
-            # Generate pseudo-labels using current weights
-            pseudo_labels = torch.stack([
-                compute_segmentation_map(feat.unsqueeze(0), binary_mask)
-                for feat in orig_features
-            ]).to(self.device)
+            # Generate pseudo-labels using one of two paths: SAM2 or PPO/k-means
+            sam2_segmentation = None
+            
+            # After warmup, SAM2 decoder becomes active as an option
+            if self.total_steps >= WARMUP_STEPS:
+                # Try to get SAM2 decoder segmentation if available
+                try:
+                    if isinstance(self.segmenter, torch.nn.parallel.DistributedDataParallel):
+                        if (hasattr(self.segmenter.module.feature_extractor, 'latest_segmentation') and 
+                            self.segmenter.module.feature_extractor.latest_segmentation is not None and
+                            'masks' in self.segmenter.module.feature_extractor.latest_segmentation):
+                            sam2_segmentation = self.segmenter.module.feature_extractor.latest_segmentation['masks']
+                    else:
+                        if (hasattr(self.segmenter.feature_extractor, 'latest_segmentation') and 
+                            self.segmenter.feature_extractor.latest_segmentation is not None and
+                            'masks' in self.segmenter.feature_extractor.latest_segmentation):
+                            sam2_segmentation = self.segmenter.feature_extractor.latest_segmentation['masks']
+                except:
+                    pass
+                
+                # Get current path selection alpha value
+                if isinstance(self.segmenter, torch.nn.parallel.DistributedDataParallel):
+                    path_alpha = self.segmenter.module.feature_extractor.path_selection_alpha.item()
+                else:
+                    path_alpha = self.segmenter.feature_extractor.path_selection_alpha.item()
+                
+                # Choose segmentation path based on probability
+                if sam2_segmentation is not None and torch.rand(1).item() < path_alpha:
+                    pseudo_labels = sam2_segmentation
+                    self.segmentation_source = 'sam2'
+                else:  # Use PPO/k-means path
+                    pseudo_labels = torch.stack([
+                        compute_segmentation_map(feat.unsqueeze(0), binary_mask.to(self.device))
+                        for feat in orig_features
+                    ]).to(self.device)
+                    self.segmentation_source = 'kmeans'
+            else:
+                # During warmup, only use k-means
+                pseudo_labels = torch.stack([
+                    compute_segmentation_map(feat.unsqueeze(0), binary_mask.to(self.device))
+                    for feat in orig_features
+                ]).to(self.device)
+                self.segmentation_source = 'kmeans'
             
             # Fine-tune if past warmup
             if self.total_steps >= WARMUP_STEPS:
@@ -364,6 +435,7 @@ class FeatureWeightingEnv(gym.Env):
                 
                 if self.writer is not None:
                     self.writer.add_scalar('Training/finetune_loss', finetune_loss, self.total_steps)
+                    self.writer.add_text('Training/segmentation_source', self.segmentation_source, self.total_steps)
             
             # Get augmented version of the same samples
             aug_indices = sample_indices  # Same indices as original
@@ -432,10 +504,30 @@ class FeatureWeightingEnv(gym.Env):
         return obs, reward, done, info
 
     def _render(self):
-        """Render current state visualization"""
-        if not self.enable_render:
-            return
-            
+        """Render the current state"""
+        print(f"[DEBUG-RENDER] Entering _render method")
+        
+        # Add debug prints at the beginning of the method
+        print(f"[DEBUG-RENDER] Current sample index: {self.current_sample_idx}")
+        print(f"[DEBUG-RENDER] Total steps: {getattr(self, 'total_steps', 'unknown')}")
+        
+        # Check if we have a valid segmenter
+        print(f"[DEBUG-RENDER] Segmenter type: {type(self.segmenter)}")
+        
+        # Check if feature_extractor exists and has latest_segmentation
+        if hasattr(self.segmenter, 'module') and hasattr(self.segmenter.module, 'feature_extractor'):
+            print("[DEBUG-RENDER] Feature extractor found")
+            print(f"[DEBUG-RENDER] Has latest_segmentation: {hasattr(self.segmenter.module.feature_extractor, 'latest_segmentation')}")
+            print(f"[DEBUG-RENDER] latest_segmentation is: {self.segmenter.module.feature_extractor.latest_segmentation}")
+        else:
+            print("[DEBUG-RENDER] Feature extractor not found or structure unexpected")
+        
+        # Add this right before the line that's causing the error (line 530)
+        if self.segmenter.module.feature_extractor.latest_segmentation is None:
+            print("[DEBUG-RENDER] ERROR: latest_segmentation is None!")
+            print("[DEBUG-RENDER] Using fallback segmentation instead of crashing")
+            # Don't modify actual code flow yet, just add debug prints
+        
         # Get current sample data
         sample_data = self.processed_samples[self.current_sample_idx]
         gt_mask = sample_data[0]
@@ -455,8 +547,45 @@ class FeatureWeightingEnv(gym.Env):
         weighted_orig_feats = orig_feats * alpha
         weighted_aug_feats = [feat * alpha for feat in aug_feats_list]
         
-        # Compute segmentation maps with binary mask
-        orig_map = compute_segmentation_map(weighted_orig_feats, binary_mask)
+        # After warmup, use same probabilistic choice for visualization
+        use_sam2_viz = False
+        if self.total_steps >= WARMUP_STEPS:
+            use_sam2_viz = torch.rand(1).item() > (1 - alpha)  # alpha% chance to show SAM2
+        
+        # Fix the ambiguous tensor boolean error
+        if isinstance(use_sam2_viz, torch.Tensor):
+            use_sam2_viz = use_sam2_viz.item() if use_sam2_viz.numel() == 1 else use_sam2_viz.any().item()
+        
+        if use_sam2_viz:
+            # Try to get SAM2 decoder output
+            sam2_output = None
+            if isinstance(self.segmenter, torch.nn.parallel.DistributedDataParallel):
+                # Check if latest_segmentation exists and is valid
+                if (hasattr(self.segmenter.module.feature_extractor, 'latest_segmentation') and 
+                    self.segmenter.module.feature_extractor.latest_segmentation is not None and
+                    'masks' in self.segmenter.module.feature_extractor.latest_segmentation):
+                    sam2_output = self.segmenter.module.feature_extractor.latest_segmentation['masks']
+            else:
+                # Same checks for non-DDP model
+                if (hasattr(self.segmenter.feature_extractor, 'latest_segmentation') and 
+                    self.segmenter.feature_extractor.latest_segmentation is not None and
+                    'masks' in self.segmenter.feature_extractor.latest_segmentation):
+                    sam2_output = self.segmenter.feature_extractor.latest_segmentation['masks']
+            
+            # If we have a valid SAM2 output, use it, otherwise fall back to k-means
+            if sam2_output is not None:
+                orig_map = sam2_output
+            else:
+                # Fall back to k-means when SAM2 output is invalid
+                use_sam2_viz = False
+                print("[DEBUG] Falling back to k-means segmentation")
+        
+        # If we're not using SAM2 visualization, use k-means
+        if not use_sam2_viz:
+            # Compute segmentation maps with binary mask (original method)
+            orig_map = compute_segmentation_map(weighted_orig_feats, binary_mask)
+        
+        # Always use k-means for augmented views for consistency
         aug_maps = [compute_segmentation_map(f, binary_mask) for f in weighted_aug_feats]
         
         # Use visualization function
@@ -467,7 +596,7 @@ class FeatureWeightingEnv(gym.Env):
             binary_mask=binary_mask,
             reward=self.reward_history[-1] if self.reward_history else 0,
             save_path=f'final_visuals/map_step_{self.total_steps}.png',
-            title=f"Step {self.total_steps}"
+            title=f"Step {self.total_steps} {'[SAM2]' if use_sam2_viz else '[K-means]'}"
         )
 
         # Update sample index

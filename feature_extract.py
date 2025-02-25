@@ -226,7 +226,7 @@ class SAM2FeatureExtractor(nn.Module):
     - Combines them using a learned mixing ratio (self.mixing_alpha)
     - Includes augmentation transforms for consistency training
     """
-    def __init__(self, pretrained=True, out_channels=256, rank=None, batch_size=64):
+    def __init__(self, pretrained=True, out_channels=256, rank=0, batch_size=64):
         super().__init__()
         self.rank = rank if rank is not None else 0
         self.device = torch.device(f"cuda:{self.rank}")
@@ -267,8 +267,8 @@ class SAM2FeatureExtractor(nn.Module):
         # Initially freeze all parameters
         self._freeze_all()
         
-        # Add mixing parameter
-        self.register_buffer('mixing_alpha', torch.tensor(0.8))
+        # This is correct since SAM2FeatureExtractor is a nn.Module
+        self.register_buffer('path_selection_alpha', torch.tensor(0.0))
         
         # Initialize optimizer with simple parameter groups
         param_groups = [
@@ -296,6 +296,9 @@ class SAM2FeatureExtractor(nn.Module):
 
         # Add binary_mask as a buffer
         self.register_buffer('binary_mask', None)
+
+        # Add this line to initialize latest_segmentation if it doesn't exist
+        self.latest_segmentation = None
 
     def _freeze_all(self):
         """Freeze all parameters initially"""
@@ -351,10 +354,10 @@ class SAM2FeatureExtractor(nn.Module):
         
         print(f"[SAM2FeatureExtractor] Layer {layer_name} unfrozen with learning rate: {current_lr:.1e}")
 
-    def set_mixing_alpha(self, alpha):
-        """Set the mixing alpha value for feature blending"""
-        self.mixing_alpha = torch.tensor(alpha)
-        
+    def set_path_selection_alpha(self, alpha):
+        """Set path selection probability (alpha = probability of using SAM2 path)"""
+        self.path_selection_alpha.fill_(alpha)
+
     def set_binary_mask(self, mask):
         """Set the binary mask buffer"""
         if self.binary_mask is None or (self.binary_mask.shape != mask.shape):
@@ -401,6 +404,7 @@ class SAM2FeatureExtractor(nn.Module):
         return self._forward_chunk(x, targets)
 
     def _forward_chunk(self, x, targets=None, sample_indices=None):
+        """Core feature extraction logic"""
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
             # Get features from image encoder
             features_dict = self.image_encoder(x)
@@ -425,43 +429,82 @@ class SAM2FeatureExtractor(nn.Module):
                     align_corners=False
                 )
             
-            # Mix features
-            mixed_features = (adapted_high + low_level_features) / 2.0
+            # Only run decoder if past warmup (when path_selection_alpha > 0)
+            if self.path_selection_alpha > 0:
+                try:
+                    # Get positional encoding - key fix: don't try to expand to batch size
+                    if hasattr(self.model, 'prompt_encoder') and self.model.prompt_encoder is not None:
+                        # Get PE with batch size 1 (don't expand it)
+                        image_pe = self.model.prompt_encoder.get_dense_pe()  # Shape [1, C, H, W]
+                    else:
+                        # Create a PE tensor with batch size 1
+                        _, C, H, W = adapted_high.shape
+                        image_pe = torch.zeros((1, 256, H, W), device=adapted_high.device)
+                    
+                    # Create empty prompt embeddings
+                    sparse_embeddings = torch.zeros(adapted_high.shape[0], 0, 256, device=adapted_high.device)
+                    dense_embeddings = torch.zeros_like(adapted_high)
+                    
+                    # Call the mask decoder - keep batch size 1 for image_pe
+                    print("[DEBUG-SAM2] About to call mask decoder")
+
+                    try:
+                        # Temporarily override the decoder's use_high_res_features flag
+                        original_use_high_res = self.mask_decoder.use_high_res_features
+                        self.mask_decoder.use_high_res_features = False
+                        
+                        # Call the decoder without high-res features
+                        result = self.mask_decoder(
+                            image_embeddings=adapted_high,
+                            image_pe=image_pe,
+                            sparse_prompt_embeddings=sparse_embeddings,
+                            dense_prompt_embeddings=dense_embeddings,
+                            multimask_output=False,
+                            repeat_image=False,
+                            high_res_features=None  # Force None
+                        )
+                        
+                        # Store the result for later use
+                        self.latest_segmentation = result
+                        
+                        # Restore original setting
+                        self.mask_decoder.use_high_res_features = original_use_high_res
+                        print("[DEBUG-SAM2] Decoder succeeded with standard path")
+                        
+                    except Exception as e:
+                        # Log the error
+                        print(f"[DEBUG-SAM2] Decoder failed with error: {e}")
+                        print(f"[DEBUG-SAM2] Error type: {type(e)}")
+                        
+                        # Return adapted features directly - don't try again
+                        if self.training and targets is not None:
+                            loss = self.criterion(adapted_high, targets)
+                            return adapted_high, loss
+                        
+                        return adapted_high
+                except Exception as e:
+                    # If anything fails, log and use fallback
+                    print(f"[DEBUG-SAM2] Error: {str(e)}")
+                    print(f"[DEBUG-SAM2] Error type: {type(e)}")
+                    result = self.mask_decoder(
+                        image_embeddings=adapted_high,
+                        image_pe=image_pe,
+                        sparse_prompt_embeddings=sparse_embeddings,
+                        dense_prompt_embeddings=dense_embeddings,
+                        multimask_output=False,
+                        repeat_image=False,
+                        high_res_features=None
+                    )
             
-            loss = None
-            if targets is not None:
-                # Get masks from decoder
-                masks, iou_pred = self.mask_decoder(
-                    image_embeddings=mixed_features,
-                    image_pe=self.model.prompt_encoder.get_dense_pe(),
-                    sparse_prompt_embeddings=torch.zeros(mixed_features.shape[0], 0, 256).to(self.device),
-                    dense_prompt_embeddings=torch.zeros_like(mixed_features),
-                    multimask_output=False
-                )
-                
-                self.latest_segmentation = {
-                    'masks': masks.squeeze(1),
-                    'indices': sample_indices
-                }
-                
-                # CHOOSE instead of mix based on probability
-                if torch.rand(1).item() < self.mixing_alpha:  # Ex: 15% chance use PPO
-                    chosen_labels = targets  # Use PPO's k-means clustering
-                else:  # Ex: 85% chance use SAM2
-                    chosen_labels = self.latest_segmentation['masks']  # Use SAM2's decoder output
-                
-                loss = self.criterion(mixed_features, chosen_labels)
+            # Default path - if we're in warmup or decoder failed
+            if self.training and targets is not None:
+                loss = self.criterion(adapted_high, targets)
+                return adapted_high, loss
             
-            return mixed_features if loss is None else (mixed_features, loss)
+            return adapted_high
 
     def finetune_step(self, images, pseudo_labels):
-        """Fine-tune SAM2 using pseudo-labels as ground truth"""
-        # Ensure inputs are on the correct device
-        if images.device != self.device:
-            images = images.to(self.device)
-        if pseudo_labels.device != self.device:
-            pseudo_labels = pseudo_labels.to(self.device)
-        
+        """Fine-tune the model using either SAM2 or PPO/k-means generated labels"""
         # Ensure proper shape and type
         if pseudo_labels.dim() == 3:
             pseudo_labels = pseudo_labels.unsqueeze(1)
@@ -500,41 +543,36 @@ class SAM2FeatureExtractor(nn.Module):
                 high_level_features = high_level_features + vision_features
                 
                 # Process through adapter
-                adapted_high = self.feature_adapter(high_level_features)
+                adapted_features = self.feature_adapter(high_level_features)
                 
                 # Match spatial dimensions if needed
-                if low_level_features.shape[-2:] != adapted_high.shape[-2:]:
-                    adapted_high = F.interpolate(
-                        adapted_high,
+                if low_level_features.shape[-2:] != adapted_features.shape[-2:]:
+                    adapted_features = F.interpolate(
+                        adapted_features,
                         size=low_level_features.shape[-2:],
                         mode='bilinear',
                         align_corners=False
                     )
                 
-                # Mix features using current alpha
-                mixed_features = (
-                    self.mixing_alpha * adapted_high + 
-                    (1 - self.mixing_alpha) * low_level_features
-                )
+                # REMOVED: No more feature mixing, we use path selection instead
+                # Just use the adapted features directly
+                features_for_loss = adapted_features
+                features_for_loss.requires_grad_(True)
                 
-                # Ensure mixed_features requires grad
-                mixed_features.requires_grad_(True)
-                
-                # Ensure chunk_labels matches mixed_features dimensions
-                if chunk_labels.shape[-2:] != mixed_features.shape[-2:]:
+                # Ensure chunk_labels matches features_for_loss dimensions
+                if chunk_labels.shape[-2:] != features_for_loss.shape[-2:]:
                     chunk_labels = F.interpolate(
                         chunk_labels,
-                        size=mixed_features.shape[-2:],
+                        size=features_for_loss.shape[-2:],
                         mode='nearest'
                     )
                 
                 # Ensure both tensors have same number of channels
-                if chunk_labels.shape[1] != mixed_features.shape[1]:
-                    chunk_labels = chunk_labels.repeat(1, mixed_features.shape[1], 1, 1)
-                
+                if chunk_labels.shape[1] != features_for_loss.shape[1]:
+                    chunk_labels = chunk_labels.repeat(1, features_for_loss.shape[1], 1, 1)
                 
                 # Compute loss
-                loss = self.criterion(mixed_features, chunk_labels)
+                loss = self.criterion(features_for_loss, chunk_labels)
                 
                 # Ensure loss requires grad
                 if not loss.requires_grad:
